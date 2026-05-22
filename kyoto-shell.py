@@ -74,14 +74,20 @@ JOBS = {}            # jobId -> dict of job state
 JOBS_LOCK = threading.Lock()
 DEFAULT_IDLE_MS = 60000
 REAPER_TICK_S = 3.0
+# Done jobs are kept around long enough for stragglers (poll/wait/list) to
+# read their final state, then garbage-collected. Without this the dict
+# grows unbounded for long-lived hosts.
+DONE_JOB_TTL_S = 1800.0
 
 
 def _spawn(command, cwd, env, idle_timeout_ms):
     """Spawn a subprocess and register it as a tracked job."""
+    # errors='replace' so a child that emits non-UTF-8 bytes (e.g.
+    # binary stdout from `cat /bin/ls`) doesn't crash the reader thread.
     proc = subprocess.Popen(
         command, shell=True, cwd=cwd, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
+        text=True, bufsize=1, encoding='utf-8', errors='replace',
     )
     job_id = 'job_' + uuid.uuid4().hex[:12]
     job = {
@@ -129,6 +135,7 @@ def _spawn(command, cwd, env, idle_timeout_ms):
         with job['lock']:
             job['exit_code'] = ec
             job['done'] = True
+            job['done_at'] = time.time()
 
     threading.Thread(target=_waiter, daemon=True).start()
     return job_id, job
@@ -167,14 +174,20 @@ def _wait_for_done(job, *, max_wait_s=None):
 
 
 def _reaper_loop():
-    """Kill jobs that have gone silent for longer than their idle timeout."""
+    """Kill idle jobs; garbage-collect done jobs older than DONE_JOB_TTL_S."""
     while True:
         time.sleep(REAPER_TICK_S)
         now = time.time()
         with JOBS_LOCK:
             items = list(JOBS.items())
-        for _jid, j in items:
+        to_evict = []
+        for jid, j in items:
             with j['lock']:
+                # GC: drop long-finished jobs so the dict doesn't grow forever.
+                done_at = j.get('done_at')
+                if done_at is not None and (now - done_at) > DONE_JOB_TTL_S:
+                    to_evict.append(jid)
+                    continue
                 if j['done'] or j['killed_reason']:
                     continue
                 idle_ms = (now - j['last_output']) * 1000
@@ -186,6 +199,10 @@ def _reaper_loop():
                 j['proc'].kill()
             except Exception:
                 pass
+        if to_evict:
+            with JOBS_LOCK:
+                for jid in to_evict:
+                    JOBS.pop(jid, None)
 
 
 threading.Thread(target=_reaper_loop, daemon=True).start()

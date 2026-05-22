@@ -81,10 +81,12 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 DEFAULT_IDLE_MS = 60000
 REAPER_TICK_S = 3.0
+DONE_JOB_TTL_S = 1800.0
 
 def _spawn(command, cwd, env, idle_timeout_ms):
     proc = subprocess.Popen(command, shell=True, cwd=cwd, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+        encoding='utf-8', errors='replace')
     job_id = 'job_' + uuid.uuid4().hex[:12]
     job = {'proc': proc, 'stdout': [], 'stderr': [], 'exit_code': None,
         'done': False, 'killed_reason': None, 'last_output': time.time(),
@@ -106,7 +108,8 @@ def _spawn(command, cwd, env, idle_timeout_ms):
         try: ec = proc.wait()
         except: ec = -1
         time.sleep(0.05)
-        with job['lock']: job['exit_code'] = ec; job['done'] = True
+        with job['lock']:
+            job['exit_code'] = ec; job['done'] = True; job['done_at'] = time.time()
     threading.Thread(target=_waiter, daemon=True).start()
     return job_id, job
 
@@ -134,14 +137,21 @@ def _reaper_loop():
         time.sleep(REAPER_TICK_S)
         now = time.time()
         with JOBS_LOCK: items = list(JOBS.items())
-        for _jid, j in items:
+        to_evict = []
+        for jid, j in items:
             with j['lock']:
+                done_at = j.get('done_at')
+                if done_at is not None and (now - done_at) > DONE_JOB_TTL_S:
+                    to_evict.append(jid); continue
                 if j['done'] or j['killed_reason']: continue
                 idle_ms = (now - j['last_output']) * 1000
                 if idle_ms <= j['idle_timeout_ms']: continue
                 j['killed_reason'] = f'idle for {int(idle_ms)}ms (limit {j["idle_timeout_ms"]}ms)'
             try: j['proc'].kill()
             except: pass
+        if to_evict:
+            with JOBS_LOCK:
+                for jid in to_evict: JOBS.pop(jid, None)
 threading.Thread(target=_reaper_loop, daemon=True).start()
 
 def _start_job_msg(msg):
