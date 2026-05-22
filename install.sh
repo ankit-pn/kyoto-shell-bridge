@@ -102,13 +102,24 @@ HOST_SCRIPT="$INSTALL_DIR/kyoto-shell.py"
 # Embedded host script. Keep in sync with install/kyoto-shell.py.
 cat > "$HOST_SCRIPT" <<'PYEOF'
 #!/usr/bin/env python3
-"""Kyoto native messaging host (embedded by install.sh)."""
+"""Kyoto native messaging host (embedded by install.sh).
+
+Supports both synchronous exec (legacy) and background jobs with
+idle-timeout-based killing. See install/kyoto-shell.py for the
+canonical, fully-commented copy.
+"""
 import json
 import os
 import struct
 import subprocess
 import sys
+import threading
+import time
 import traceback
+import uuid
+
+
+_write_lock = threading.Lock()
 
 
 def _read_message():
@@ -124,67 +135,272 @@ def _read_message():
 
 def _write_message(obj):
     body = json.dumps(obj).encode('utf-8')
-    sys.stdout.buffer.write(struct.pack('<I', len(body)))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
+    with _write_lock:
+        sys.stdout.buffer.write(struct.pack('<I', len(body)))
+        sys.stdout.buffer.write(body)
+        sys.stdout.buffer.flush()
 
 
-def _handle(msg):
-    out = {'id': msg.get('id')}
-    if msg.get('type') == 'ping':
-        out['type'] = 'pong'
-        out['platform'] = sys.platform
-        out['cwd'] = os.getcwd()
-        return out
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+DEFAULT_IDLE_MS = 60000
+REAPER_TICK_S = 3.0
 
-    command = msg.get('command')
-    if not isinstance(command, str) or not command.strip():
-        out['error'] = 'command is required'
-        return out
 
+def _spawn(command, cwd, env, idle_timeout_ms):
+    proc = subprocess.Popen(
+        command, shell=True, cwd=cwd, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    job_id = 'job_' + uuid.uuid4().hex[:12]
+    job = {
+        'proc': proc,
+        'stdout': [],
+        'stderr': [],
+        'exit_code': None,
+        'done': False,
+        'killed_reason': None,
+        'last_output': time.time(),
+        'started_at': time.time(),
+        'idle_timeout_ms': max(2000, int(idle_timeout_ms)),
+        'command': command[:240],
+        'cwd': cwd or os.getcwd(),
+        'lock': threading.Lock(),
+    }
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+
+    def _reader(stream, key):
+        try:
+            for line in iter(stream.readline, ''):
+                with job['lock']:
+                    job[key].append(line)
+                    job['last_output'] = time.time()
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=_reader, args=(proc.stdout, 'stdout'), daemon=True).start()
+    threading.Thread(target=_reader, args=(proc.stderr, 'stderr'), daemon=True).start()
+
+    def _waiter():
+        try:
+            ec = proc.wait()
+        except Exception:
+            ec = -1
+        time.sleep(0.05)
+        with job['lock']:
+            job['exit_code'] = ec
+            job['done'] = True
+
+    threading.Thread(target=_waiter, daemon=True).start()
+    return job_id, job
+
+
+def _job_snapshot(job, *, drain=False):
+    now = time.time()
+    with job['lock']:
+        stdout_text = ''.join(job['stdout'])
+        stderr_text = ''.join(job['stderr'])
+        if drain:
+            job['stdout'].clear()
+            job['stderr'].clear()
+        return {
+            'stdout': stdout_text,
+            'stderr': stderr_text,
+            'exitCode': job['exit_code'],
+            'done': job['done'],
+            'killedReason': job['killed_reason'],
+            'idleMs': int((now - job['last_output']) * 1000),
+            'elapsedMs': int((now - job['started_at']) * 1000),
+            'idleTimeoutMs': job['idle_timeout_ms'],
+        }
+
+
+def _wait_for_done(job, *, max_wait_s=None):
+    deadline = (time.time() + max_wait_s) if max_wait_s is not None else None
+    while True:
+        with job['lock']:
+            if job['done']:
+                return True
+        if deadline is not None and time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def _reaper_loop():
+    while True:
+        time.sleep(REAPER_TICK_S)
+        now = time.time()
+        with JOBS_LOCK:
+            items = list(JOBS.items())
+        for _jid, j in items:
+            with j['lock']:
+                if j['done'] or j['killed_reason']:
+                    continue
+                idle_ms = (now - j['last_output']) * 1000
+                if idle_ms <= j['idle_timeout_ms']:
+                    continue
+                j['killed_reason'] = f'idle for {int(idle_ms)}ms (limit {j["idle_timeout_ms"]}ms)'
+            try:
+                j['proc'].kill()
+            except Exception:
+                pass
+
+
+threading.Thread(target=_reaper_loop, daemon=True).start()
+
+
+def _start_job_msg(msg):
+    cmd = msg.get('command')
+    if not isinstance(cmd, str) or not cmd.strip():
+        return {'id': msg.get('id'), 'error': 'command is required'}
     cwd = msg.get('cwd') or None
-    timeout_ms = int(msg.get('timeoutMs') or 60000)
+    env = os.environ.copy()
+    if isinstance(msg.get('env'), dict):
+        env.update({k: str(v) for k, v in msg['env'].items()})
+    idle_ms = int(msg.get('idleTimeoutMs') or DEFAULT_IDLE_MS)
+    try:
+        job_id, _job = _spawn(cmd, cwd, env, idle_ms)
+    except FileNotFoundError as e:
+        return {'id': msg.get('id'), 'error': f'command not found: {e}'}
+    except Exception as e:
+        return {'id': msg.get('id'), 'error': f'spawn failed: {e}'}
+    return {'id': msg.get('id'), 'type': 'job_started', 'jobId': job_id, 'idleTimeoutMs': idle_ms}
+
+
+def _poll_msg(msg):
+    job_id = msg.get('jobId')
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        return {'id': msg.get('id'), 'error': f'no such job: {job_id}'}
+    snap = _job_snapshot(job, drain=bool(msg.get('clear')))
+    return {'id': msg.get('id'), 'type': 'job_status', 'jobId': job_id, **snap}
+
+
+def _kill_msg(msg):
+    job_id = msg.get('jobId')
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        return {'id': msg.get('id'), 'error': f'no such job: {job_id}'}
+    with job['lock']:
+        if not job['killed_reason']:
+            job['killed_reason'] = msg.get('reason') or 'requested'
+    try:
+        job['proc'].kill()
+    except Exception:
+        pass
+    return {'id': msg.get('id'), 'type': 'job_killed', 'jobId': job_id}
+
+
+def _list_msg(msg):
+    now = time.time()
+    with JOBS_LOCK:
+        items = list(JOBS.items())
+    out = []
+    for jid, j in items:
+        with j['lock']:
+            out.append({
+                'jobId': jid,
+                'command': j['command'],
+                'cwd': j['cwd'],
+                'done': j['done'],
+                'exitCode': j['exit_code'],
+                'killedReason': j['killed_reason'],
+                'idleMs': int((now - j['last_output']) * 1000),
+                'elapsedMs': int((now - j['started_at']) * 1000),
+                'idleTimeoutMs': j['idle_timeout_ms'],
+            })
+    return {'id': msg.get('id'), 'type': 'jobs', 'jobs': out}
+
+
+def _sync_exec_msg(msg):
+    cmd = msg.get('command')
+    if not isinstance(cmd, str) or not cmd.strip():
+        return {'id': msg.get('id'), 'error': 'command is required'}
+    cwd = msg.get('cwd') or None
     env = os.environ.copy()
     if isinstance(msg.get('env'), dict):
         env.update({k: str(v) for k, v in msg['env'].items()})
 
+    idle_ms = msg.get('idleTimeoutMs')
+    if idle_ms is not None:
+        try:
+            job_id, job = _spawn(cmd, cwd, env, int(idle_ms))
+        except FileNotFoundError as e:
+            return {'id': msg.get('id'), 'error': f'command not found: {e}'}
+        except Exception as e:
+            return {'id': msg.get('id'), 'error': f'spawn failed: {e}'}
+        _wait_for_done(job)
+        snap = _job_snapshot(job)
+        out = {'id': msg.get('id'), 'cwd': job['cwd'], **snap, 'jobId': job_id}
+        if snap['killedReason']:
+            out['error'] = f'killed: {snap["killedReason"]}'
+            if out.get('exitCode') is None:
+                out['exitCode'] = -1
+        return out
+
+    timeout_ms = int(msg.get('timeoutMs') or 60000)
     try:
         result = subprocess.run(
-            command, shell=True, cwd=cwd, env=env,
+            cmd, shell=True, cwd=cwd, env=env,
             capture_output=True, text=True, timeout=timeout_ms / 1000.0,
         )
-        out.update(
-            stdout=result.stdout,
-            stderr=result.stderr,
-            exitCode=result.returncode,
-            cwd=cwd or os.getcwd(),
-        )
+        return {
+            'id': msg.get('id'),
+            'stdout': result.stdout,
+            'stderr': result.stderr,
+            'exitCode': result.returncode,
+            'cwd': cwd or os.getcwd(),
+        }
     except subprocess.TimeoutExpired as e:
-        out.update(
-            error=f'timed out after {timeout_ms} ms',
-            stdout=(e.stdout or '') if isinstance(e.stdout, str) else '',
-            stderr=(e.stderr or '') if isinstance(e.stderr, str) else '',
-            exitCode=-1,
-        )
+        return {
+            'id': msg.get('id'),
+            'error': f'timed out after {timeout_ms} ms',
+            'stdout': (e.stdout or '') if isinstance(e.stdout, str) else '',
+            'stderr': (e.stderr or '') if isinstance(e.stderr, str) else '',
+            'exitCode': -1,
+        }
     except FileNotFoundError as e:
-        out['error'] = f'command not found: {e}'
-    except Exception:  # noqa: BLE001
-        out['error'] = traceback.format_exc(limit=2)
-    return out
+        return {'id': msg.get('id'), 'error': f'command not found: {e}'}
+    except Exception:
+        return {'id': msg.get('id'), 'error': traceback.format_exc(limit=2)}
+
+
+def _handle(msg):
+    t = msg.get('type')
+    if t == 'ping':
+        return {'id': msg.get('id'), 'type': 'pong', 'platform': sys.platform, 'cwd': os.getcwd(), 'jobs': True}
+    if t == 'exec_bg':
+        return _start_job_msg(msg)
+    if t == 'job_poll':
+        return _poll_msg(msg)
+    if t == 'job_kill':
+        return _kill_msg(msg)
+    if t == 'jobs_list':
+        return _list_msg(msg)
+    return _sync_exec_msg(msg)
 
 
 def main():
     while True:
         try:
             msg = _read_message()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             sys.stderr.write(f'kyoto-shell: read error: {e}\n')
             return
         if msg is None:
             return
         try:
             _write_message(_handle(msg))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             try:
                 _write_message({'id': msg.get('id') if isinstance(msg, dict) else None,
                                 'error': f'host exception: {e}'})
